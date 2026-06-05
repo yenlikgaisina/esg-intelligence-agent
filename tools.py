@@ -2,13 +2,14 @@
 tools.py — Tools the ESG Intelligence Agent can use.
 
 Seven tools:
-  1. web_search            — search ESG reports, construction news, regulations
-  2. read_page             — read full content of a report / article / regulation
-  3. lookup_carbon_factor  — query the embodied-carbon factor database
-  4. estimate_embodied_carbon — run an automated A1-A3 LCA on a bill of materials
-  5. load_history          — load previous run so the agent can track trends
-  6. save_report           — write the markdown report, render a PDF, update history
-"""
+  1. web_search             — search ESG reports, construction news, regulations
+    2. read_page              — read full content of a report / article / regulation
+      3. lookup_carbon_factor   — query the embodied-carbon factor database
+        4. estimate_embodied_carbon — run an automated A1-A3 LCA on a bill of materials
+          5. load_history           — load previous run so the agent can track trends
+            6. save_report            — write the markdown report, render a PDF, update history
+              7. openai_analysis        — cross-check LCA results or regulatory text with GPT-4o
+              """
 
 import os
 import json
@@ -21,289 +22,297 @@ from bs4 import BeautifulSoup
 import carbon_data
 import lca
 from report import markdown_to_pdf
-from config import REPORTS_DIR, DATA_DIR, HISTORY_FILE, USER_AGENT
-
+from config import REPORTS_DIR, DATA_DIR, HISTORY_FILE, USER_AGENT, OPENAI_MODEL, OPENAI_ENABLED
 
 # ──────────────────────────────────────────────────────────────────────────
 # TOOL 1: Web search (Tavily)
 # ──────────────────────────────────────────────────────────────────────────
 
-def web_search(query: str, num_results: int = 8, focus: str = "general") -> str:
-    """
-    Search the web via Tavily for ESG / construction / regulation intelligence.
-    `focus` ('regulation' | 'news' | 'esg_report' | 'carbon' | 'general')
-    biases the query toward authoritative sources.
-    """
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return json.dumps({"error": "TAVILY_API_KEY not set."})
+def web_search(query: str, max_results: int = 5) -> str:
+      """Search the web for ESG / construction / regulatory content."""
+      api_key = os.getenv("TAVILY_API_KEY")
+      if not api_key:
+                return "TAVILY_API_KEY not set — web search unavailable."
+            try:
+                      resp = requests.post(
+                                    "https://api.tavily.com/search",
+                                    json={"api_key": api_key, "query": query, "max_results": max_results,
+                                                            "search_depth": "advanced", "include_answer": True},
+                                    timeout=30,
+                      )
+                      resp.raise_for_status()
+                      data = resp.json()
+                      lines = []
+                      if data.get("answer"):
+                                    lines.append(f"Summary: {data['answer']}\n")
+                                for r in data.get("results", []):
+                                              lines.append(f"- [{r['title']}]({r['url']})\n  {r.get('content','')[:300]}")
+                                          return "\n".join(lines) if lines else "No results."
+except Exception as e:
+        return f"Search error: {e}"
 
-    hints = {
-        "regulation": " ESG regulation policy 2025 2026 (CSRD OR CBAM OR taxonomy OR disclosure)",
-        "news": " construction sustainability news 2026",
-        "esg_report": " ESG sustainability report disclosure",
-        "carbon": " embodied carbon EPD building materials trend",
-        "general": "",
-    }
-    full_query = f"{query}{hints.get(focus, '')}"
 
+# ──────────────────────────────────────────────────────────────────────────
+# TOOL 2: Read a web page
+# ──────────────────────────────────────────────────────────────────────────
+
+def read_page(url: str) -> str:
+      """Fetch and return the plain-text content of a web page (max 8 000 chars)."""
     try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": api_key,
-                "query": full_query,
-                "max_results": num_results,
-                "search_depth": "advanced",
-                "include_answer": True,
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        out = {
-            "answer": data.get("answer", ""),
-            "results": [
-                {"title": r.get("title", ""), "url": r.get("url", ""),
-                 "snippet": r.get("content", "")[:500]}
-                for r in data.get("results", [])
-            ],
-        }
-        return json.dumps(out, indent=2, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+              r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+                      tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        return text[:8000]
+except Exception as e:
+        return f"Error reading {url}: {e}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# TOOL 2: Read a page
+# TOOL 3: Look up a single carbon factor
 # ──────────────────────────────────────────────────────────────────────────
 
-def read_page(url: str, max_chars: int = 4000) -> str:
-    """Fetch and return cleaned text from a URL (report, article, or regulation)."""
+def lookup_carbon_factor(material: str) -> str:
+      """Return the embodied-carbon factor (kgCO2e/unit) for a named material."""
+    result = carbon_data.lookup(material)
+    if result:
+              return (
+                            f"Material: {result['name']}\n"
+                            f"Factor:   {result['factor_kgco2e_per_unit']} kgCO2e/{result['unit']}\n"
+                            f"Source:   {result['source']}\n"
+                            f"Notes:    {result.get('notes', '—')}"
+              )
+    return f"No carbon factor found for '{material}'. Try a broader term."
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TOOL 4: Estimate embodied carbon for a bill of materials
+# ──────────────────────────────────────────────────────────────────────────
+
+def estimate_embodied_carbon(materials_json: str) -> str:
+      """
+          Run a cradle-to-gate (A1-A3) LCA on a bill of materials.
+
+              materials_json: JSON array of {"material": str, "quantity": float, "unit": str}
+                  Returns a formatted report with total tCO2e, hotspots, and lower-carbon swaps.
+                      """
     try:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
-            tag.decompose()
-        text = "\n".join(
-            ln for ln in soup.get_text("\n", strip=True).splitlines() if ln.strip()
-        )
-        return text[:max_chars] + ("..." if len(text) > max_chars else "")
-    except Exception as e:
-        return f"Error reading page: {e}"
+              items = json.loads(materials_json)
+except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    return lca.run(items)
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# TOOL 3: Carbon factor lookup
+# TOOL 5: Load run history
 # ──────────────────────────────────────────────────────────────────────────
 
-def lookup_carbon_factor(material: str = "", list_all: bool = False) -> str:
-    """Look up the embodied carbon factor for a material, or list the catalogue."""
-    if list_all or not material:
-        return json.dumps(carbon_data.list_materials(), indent=2)
-    key, rec = carbon_data.find_material(material)
-    if not rec:
-        return json.dumps({
-            "found": False, "query": material,
-            "hint": "No close match. Call lookup_carbon_factor with list_all=true to see the catalogue.",
-        })
-    out = {"found": True, "query": material, **rec}
-    sub = carbon_data.SUBSTITUTIONS.get(key)
-    if sub:
-        sk, advice = sub
-        out["lower_carbon_alternative"] = {
-            "name": carbon_data.MATERIALS[sk]["name"],
-            "factor_kgco2e_per_kg": carbon_data.MATERIALS[sk]["factor"],
-            "advice": advice,
-        }
-    return json.dumps(out, indent=2)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# TOOL 4: Automated LCA
-# ──────────────────────────────────────────────────────────────────────────
-
-def estimate_embodied_carbon(bill_of_materials: str) -> str:
-    """
-    Run an automated cradle-to-gate (A1-A3) embodied-carbon estimate.
-    `bill_of_materials` is a JSON array of {"material","quantity","unit"} objects.
-    Units: kg, t, m3.
-    """
-    try:
-        bom = json.loads(bill_of_materials) if isinstance(bill_of_materials, str) else bill_of_materials
-        if isinstance(bom, dict) and "bill_of_materials" in bom:
-            bom = bom["bill_of_materials"]
-        if not isinstance(bom, list):
-            return json.dumps({"error": "bill_of_materials must be a JSON array of objects."})
-    except Exception as e:
-        return json.dumps({"error": f"Could not parse bill_of_materials JSON: {e}"})
-
-    result = lca.calculate(bom)
-    return json.dumps(result, indent=2)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# TOOL 5: Load history
-# ──────────────────────────────────────────────────────────────────────────
-
-def load_history() -> str:
-    """Load the previous run's tracked metrics so the agent can report trends."""
+def load_history(n_last: int = 5) -> str:
+      """Load the last N briefing summaries so the agent can spot trends."""
     if not os.path.exists(HISTORY_FILE):
-        return json.dumps({
-            "message": "No history found — this appears to be the first run.",
-            "previous": {},
-        })
+              return "No history yet — this is the first run."
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.dumps(json.load(f), indent=2, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Could not load history: {e}"})
+              with open(HISTORY_FILE, encoding="utf-8") as f:
+                            history = json.load(f)
+                        entries = history[-n_last:]
+        lines = [f"=== Last {len(entries)} runs ==="]
+        for e in entries:
+                      lines.append(
+                          f"\n{e.get('date','?')} | {e.get('headline','(no headline)')}\n"
+                          f"  Top material: {e.get('top_material','?')} | "
+                          f"Total tCO2e: {e.get('total_tco2e','?')}"
+        )
+        return "\n".join(lines)
+except Exception as ex:
+        return f"Error loading history: {ex}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# TOOL 6: Save the report (markdown + PDF + history)
+# TOOL 6: Save the report
 # ──────────────────────────────────────────────────────────────────────────
 
-def save_report(content: str, metrics: str = "{}") -> str:
-    """
-    Save the markdown report, render it to PDF, and update history.json.
+def save_report(markdown: str, metrics_json: str = "{}") -> str:
+      """
+          Save today's briefing as markdown + PDF, and append a summary to history.
 
-    `metrics` is a JSON object of trackable numbers to compare next run, e.g.
-    {"watched_regulations": 6, "key_material_factors": {"steel": 1.55},
-     "headline": "EU CBAM definitive period tightens steel reporting"}.
-    """
+              markdown:     full markdown text of the briefing
+                  metrics_json: JSON string with keys: headline, top_material, total_tco2e
+                      """
     os.makedirs(REPORTS_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
-    today = date.today().isoformat()
 
+    today = date.today().isoformat()
     md_path = os.path.join(REPORTS_DIR, f"esg_brief_{today}.md")
     pdf_path = os.path.join(REPORTS_DIR, f"esg_brief_{today}.pdf")
 
-    try:
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(content)
-    except Exception as e:
-        return f"Error saving markdown report: {e}"
+    with open(md_path, "w", encoding="utf-8") as f:
+              f.write(markdown)
 
-    pdf_msg = ""
-    try:
-        if markdown_to_pdf(content, pdf_path):
-            pdf_msg = f" PDF rendered: {pdf_path}."
-        else:
-            pdf_msg = " (PDF skipped — install 'reportlab' to enable PDF output.)"
-    except Exception as e:
-        pdf_msg = f" (PDF render failed: {e})"
+    pdf_result = markdown_to_pdf(markdown, pdf_path)
 
+    # Update history
     try:
-        parsed = json.loads(metrics) if isinstance(metrics, str) else metrics
-    except Exception:
-        parsed = {"raw": metrics}
-    history = {"date": today, "report_file": md_path, "metrics": parsed}
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        return f"Report saved to {md_path}, but failed to update history: {e}"
+              metrics = json.loads(metrics_json)
+except Exception:
+        metrics = {}
 
-    return f"Report saved to {md_path}.{pdf_msg} History updated for tomorrow's comparison."
+    history = []
+    if os.path.exists(HISTORY_FILE):
+              with open(HISTORY_FILE, encoding="utf-8") as f:
+                            try:
+                                              history = json.load(f)
+except Exception:
+                history = []
+
+    history.append({
+              "date": today,
+              "headline": metrics.get("headline", ""),
+              "top_material": metrics.get("top_material", ""),
+              "total_tco2e": metrics.get("total_tco2e", ""),
+    })
+
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+              json.dump(history, f, indent=2)
+
+    return (
+              f"Report saved:\n  Markdown: {md_path}\n  PDF: {pdf_result}\n"
+              f"  History entries: {len(history)}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Registry
+# TOOL 7: OpenAI cross-check analysis
+# ──────────────────────────────────────────────────────────────────────────
+
+def openai_analysis(prompt: str, context: str = "") -> str:
+      """
+          Send a prompt (+ optional context) to GPT-4o for a second-opinion analysis.
+
+              Use cases:
+                    - Cross-check an LCA result: did Claude miss anything?
+                          - Summarise a dense regulatory text (e.g. EU CBAM implementing act)
+                                - Get an alternative framing of carbon-reduction recommendations
+
+                                    Returns GPT-4o's response as plain text, or a clear error if the key is missing.
+                                        """
+    if not OPENAI_ENABLED:
+              return "OpenAI cross-check skipped — OPENAI_API_KEY not set."
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    messages = []
+    if context:
+              messages.append({"role": "system", "content": context})
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+              resp = requests.post(
+                            "https://api.openai.com/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            json={"model": OPENAI_MODEL, "messages": messages, "max_tokens": 1500, "temperature": 0.3},
+                            timeout=60,
+              )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+except requests.HTTPError as e:
+        return f"OpenAI API error {e.response.status_code}: {e.response.text[:300]}"
+except Exception as e:
+        return f"OpenAI call failed: {e}"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tool registry — used by agent.py
 # ──────────────────────────────────────────────────────────────────────────
 
 TOOL_FUNCTIONS = {
-    "web_search": web_search,
-    "read_page": read_page,
-    "lookup_carbon_factor": lookup_carbon_factor,
-    "estimate_embodied_carbon": estimate_embodied_carbon,
-    "load_history": load_history,
-    "save_report": save_report,
+      "web_search": web_search,
+      "read_page": read_page,
+      "lookup_carbon_factor": lookup_carbon_factor,
+      "estimate_embodied_carbon": estimate_embodied_carbon,
+      "load_history": load_history,
+      "save_report": save_report,
+      "openai_analysis": openai_analysis,
 }
 
 TOOL_DEFINITIONS = [
-    {
-        "name": "web_search",
-        "description": (
-            "Search the web for ESG intelligence: ESG/sustainability reports, "
-            "construction-sector news, and sustainability regulations. Set `focus` "
-            "to 'regulation', 'news', 'esg_report', or 'carbon' to target authoritative "
-            "sources. Returns a synthesised answer plus titles, URLs and snippets."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results (default 8)", "default": 8},
-                "focus": {"type": "string", "enum": ["general", "regulation", "news", "esg_report", "carbon"],
-                          "description": "Source bias", "default": "general"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "read_page",
-        "description": "Read the full cleaned text of a URL — a regulation page, ESG report, or news article.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"url": {"type": "string", "description": "Full URL to read"}},
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "lookup_carbon_factor",
-        "description": (
-            "Look up the embodied carbon factor (kgCO2e/kg, cradle-to-gate A1-A3) for a "
-            "construction material from the built-in database, including any lower-carbon "
-            "alternative. Set list_all=true to retrieve the whole catalogue."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "material": {"type": "string", "description": "Material name, e.g. 'rebar', 'concrete C32/40', 'aluminium'"},
-                "list_all": {"type": "boolean", "description": "Return the full catalogue", "default": False},
-            },
-        },
-    },
-    {
-        "name": "estimate_embodied_carbon",
-        "description": (
-            "Run an automated cradle-to-gate (A1-A3) embodied-carbon estimate for a bill of "
-            "materials. Returns total tCO2e, per-material breakdown, carbon hotspots, and "
-            "circular-economy substitutions with quantified savings. Use this to demonstrate "
-            "the '1clickLCA-style' automated assessment on any project example you find or invent."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "bill_of_materials": {
-                    "type": "string",
-                    "description": 'JSON array, e.g. [{"material":"concrete C32/40","quantity":120,"unit":"m3"},{"material":"rebar","quantity":9.5,"unit":"t"}]. Units: kg, t, m3.',
+      {
+                "name": "web_search",
+                "description": "Search the web for ESG reports, construction news, sustainability regulations, and embodied-carbon research.",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {
+                                                "query": {"type": "string", "description": "Search query"},
+                                                "max_results": {"type": "integer", "description": "Number of results (default 5)", "default": 5},
+                              },
+                              "required": ["query"],
                 },
-            },
-            "required": ["bill_of_materials"],
-        },
-    },
-    {
-        "name": "load_history",
-        "description": "Load the previous run's tracked metrics so you can report what changed since last time. Call this FIRST.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "save_report",
-        "description": (
-            "Save the final markdown report, render it to a branded PDF, and update history.json "
-            "for tomorrow's trend comparison. Pass the full markdown in `content` and a JSON object "
-            "of trackable metrics in `metrics`."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "Full markdown report"},
-                "metrics": {"type": "string", "description": "JSON object of numbers/headlines to track over time"},
-            },
-            "required": ["content"],
-        },
-    },
+      },
+      {
+                "name": "read_page",
+                "description": "Fetch and read the full text of a web page (report, article, regulation).",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {"url": {"type": "string", "description": "URL to fetch"}},
+                              "required": ["url"],
+                },
+      },
+      {
+                "name": "lookup_carbon_factor",
+                "description": "Look up the embodied-carbon emission factor for a specific construction material.",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {"material": {"type": "string", "description": "Material name (e.g. 'rebar', 'concrete C30/37', 'GGBS')"}},
+                              "required": ["material"],
+                },
+      },
+      {
+                "name": "estimate_embodied_carbon",
+                "description": "Run a cradle-to-gate (A1-A3) LCA on a project bill of materials. Returns total tCO2e, hotspot breakdown, and lower-carbon substitution options.",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {
+                                                "materials_json": {
+                                                                      "type": "string",
+                                                                      "description": 'JSON array: [{"material": "concrete C32/40", "quantity": 500, "unit": "m3"}, ...]',
+                                                }
+                              },
+                              "required": ["materials_json"],
+                },
+      },
+      {
+                "name": "load_history",
+                "description": "Load previous briefing summaries to track carbon trends over time.",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {"n_last": {"type": "integer", "description": "How many past runs to load (default 5)", "default": 5}},
+                },
+      },
+      {
+                "name": "save_report",
+                "description": "Save today's ESG briefing as markdown + PDF and record metrics in history.",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {
+                                                "markdown": {"type": "string", "description": "Full markdown text of the briefing"},
+                                                "metrics_json": {
+                                                                      "type": "string",
+                                                                      "description": 'JSON: {"headline": "...", "top_material": "...", "total_tco2e": 123.4}',
+                                                },
+                              },
+                              "required": ["markdown"],
+                },
+      },
+      {
+                "name": "openai_analysis",
+                "description": "Send a prompt to GPT-4o for a second-opinion cross-check. Use to validate LCA results, interpret dense regulatory text (e.g. EU CBAM), or get an alternative framing of carbon recommendations. Gracefully skipped if OPENAI_API_KEY is not set.",
+                "input_schema": {
+                              "type": "object",
+                              "properties": {
+                                                "prompt": {"type": "string", "description": "The question or analysis request for GPT-4o"},
+                                                "context": {"type": "string", "description": "Optional system context (e.g. paste of a regulation excerpt or LCA output to review)"},
+                              },
+                              "required": ["prompt"],
+                },
+      },
 ]
