@@ -1,4 +1,4 @@
-name: Daily ESG Briefing
+—name: Daily ESG Briefing
 
 # Runs every morning and commits the new briefing (markdown + PDF) back to the repo.
 on:
