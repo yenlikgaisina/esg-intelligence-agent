@@ -1,18 +1,14 @@
 """
 agent.py — ESG Intelligence Agent
-
 Runs every morning to scan ESG reports, construction news, and sustainability
 regulations, track embodied-carbon trends, run an automated A1-A3 LCA, and
 generate a branded PDF briefing for construction/built-environment clients.
-
 Built for the Kazakhstan + global construction market (with a CBAM lens), this
 adapts the daily-monitor agent pattern into a sustainability intelligence tool.
-
 Usage:
     python agent.py                # run today's briefing now
     python agent.py --show-last    # print the most recent briefing
     python agent.py --demo-lca     # run a sample embodied-carbon estimate only
-
 Automate it:
     Mac/Linux cron:  0 7 * * *  cd /path/to/esg-intelligence-agent && python agent.py
     Or use the included GitHub Actions workflow (.github/workflows/daily-esg-brief.yml).
@@ -23,12 +19,11 @@ import sys
 import json
 import glob
 
-import anthropic
+import google.generativeai as genai
 
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS
 from prompts import get_system_prompt
 from config import MODEL, MAX_TOKENS, MAX_STEPS, REPORTS_DIR, FOCUS_REGION
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -36,7 +31,6 @@ from config import MODEL, MAX_TOKENS, MAX_STEPS, REPORTS_DIR, FOCUS_REGION
 
 def log(label: str, text: str, color: str = "0"):
     print(f"\033[{color}m[{label}]\033[0m {text}")
-
 
 def run_tool(name: str, inputs: dict) -> str:
     if name not in TOOL_FUNCTIONS:
@@ -46,7 +40,6 @@ def run_tool(name: str, inputs: dict) -> str:
         return result if isinstance(result, str) else json.dumps(result)
     except Exception as e:
         return f"Tool error in {name}: {e}"
-
 
 def show_last_report():
     reports = sorted(glob.glob(os.path.join(REPORTS_DIR, "esg_brief_*.md")), reverse=True)
@@ -58,108 +51,133 @@ def show_last_report():
     with open(latest, encoding="utf-8") as f:
         print(f.read())
 
-
 def demo_lca():
     """Run the automated LCA engine on a sample project — no API key needed."""
     from tools import estimate_embodied_carbon
     sample = json.dumps([
         {"material": "concrete C32/40", "quantity": 850, "unit": "m3"},
-        {"material": "rebar", "quantity": 95, "unit": "t"},
-        {"material": "structural steel", "quantity": 60, "unit": "t"},
-        {"material": "aluminium", "quantity": 8, "unit": "t"},
-        {"material": "glass", "quantity": 22, "unit": "t"},
-        {"material": "mineral wool", "quantity": 12, "unit": "t"},
+        {"material": "rebar",           "quantity": 95,  "unit": "t"},
+        {"material": "structural steel","quantity": 60,  "unit": "t"},
+        {"material": "aluminium",       "quantity": 8,   "unit": "t"},
+        {"material": "glass",           "quantity": 22,  "unit": "t"},
+        {"material": "mineral wool",    "quantity": 12,  "unit": "t"},
     ])
     print("Sample project — mid-rise concrete-frame office:\n")
     print(estimate_embodied_carbon(sample))
 
-
-DAILY_QUESTION = f"""
-Produce today's ESG intelligence briefing for the {FOCUS_REGION} construction market.
-
-Follow your process exactly: load history first; scan all four streams (ESG reports,
-construction news, regulations with a CBAM lens, embodied carbon); read at least 3
-sources in full; run at least one automated embodied-carbon estimate; connect the
-regulation/news to the carbon numbers and to concrete client actions; then save_report
-with the full markdown and a metrics JSON.
-
-Be specific, quantitative, and senior. This briefing goes to construction clients.
-"""
-
+DAILY_QUESTION = (
+    f"Produce today's ESG intelligence briefing for the {FOCUS_REGION} construction market. "
+    "Follow your process exactly: load history first; scan all four streams (ESG reports, "
+    "construction news, regulations with a CBAM lens, embodied carbon); read at least 3 "
+    "sources in full; run at least one automated embodied-carbon estimate; connect the "
+    "regulation/news to the carbon numbers and to concrete client actions; then save_report "
+    "with the full markdown and a metrics JSON. "
+    "Be specific, quantitative, and senior. This briefing goes to construction clients."
+)
 
 # ──────────────────────────────────────────────────────────────────────────
-# Main loop
+# Gemini tool schema conversion
+# ──────────────────────────────────────────────────────────────────────────
+
+def _build_gemini_tools(tool_defs):
+    """Convert Anthropic-style tool definitions to Gemini FunctionDeclarations."""
+    type_map = {
+        "string": genai.protos.Type.STRING,
+        "integer": genai.protos.Type.INTEGER,
+        "number": genai.protos.Type.NUMBER,
+        "boolean": genai.protos.Type.BOOLEAN,
+        "array": genai.protos.Type.ARRAY,
+        "object": genai.protos.Type.OBJECT,
+    }
+    declarations = []
+    for t in tool_defs:
+        schema = t.get("input_schema", {})
+        props = {}
+        for prop_name, prop_def in schema.get("properties", {}).items():
+            g_type = type_map.get(prop_def.get("type", "string"), genai.protos.Type.STRING)
+            props[prop_name] = genai.protos.Schema(
+                type=g_type,
+                description=prop_def.get("description", ""),
+            )
+        declarations.append(
+            genai.protos.FunctionDeclaration(
+                name=t["name"],
+                description=t.get("description", ""),
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties=props,
+                    required=schema.get("required", []),
+                ),
+            )
+        )
+    return [genai.protos.Tool(function_declarations=declarations)]
+
+# ──────────────────────────────────────────────────────────────────────────
+# Main agentic loop
 # ──────────────────────────────────────────────────────────────────────────
 
 def run_agent():
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    messages = [{"role": "user", "content": DAILY_QUESTION}]
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    gemini_tools = _build_gemini_tools(TOOL_DEFINITIONS)
+    model = genai.GenerativeModel(
+        model_name=MODEL,
+        system_instruction=get_system_prompt(),
+        tools=gemini_tools,
+    )
+    chat = model.start_chat()
 
     print(f"\n{'─'*64}")
-    print(f"🌍  ESG Intelligence Agent  ·  focus: {FOCUS_REGION}  ·  model: {MODEL}")
+    print(f"🌍 ESG Intelligence Agent · focus: {FOCUS_REGION} · model: {MODEL}")
     print(f"{'─'*64}")
+
+    response = chat.send_message(DAILY_QUESTION)
 
     step = 0
     while step < MAX_STEPS:
         step += 1
         log("STEP", f"{step}/{MAX_STEPS}", "90")
 
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=get_system_prompt(),
-            tools=TOOL_DEFINITIONS,
-            messages=messages,
-        )
+        candidate = response.candidates[0]
+        finish_reason = candidate.finish_reason
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    log("THINKING", block.text.strip()[:220], "93")
-                if block.type == "tool_use":
-                    name, inputs = block.name, block.input
-                    if name == "web_search":
-                        log("SEARCH", f'[{inputs.get("focus","general")}] {inputs.get("query","")}', "95")
-                    elif name == "read_page":
-                        log("READ", inputs.get("url", "")[:80], "94")
-                    elif name == "lookup_carbon_factor":
-                        log("CARBON", f'lookup: {inputs.get("material","(catalogue)")}', "96")
-                    elif name == "estimate_embodied_carbon":
-                        log("LCA", "running embodied-carbon estimate...", "96")
-                    elif name == "load_history":
-                        log("HISTORY", "loading previous briefing...", "96")
-                    elif name == "save_report":
-                        log("SAVING", "writing report + rendering PDF...", "92")
+        text_parts = []
+        fn_calls = []
+        for part in candidate.content.parts:
+            if hasattr(part, "text") and part.text:
+                text_parts.append(part.text)
+            if hasattr(part, "function_call") and part.function_call.name:
+                fn_calls.append(part.function_call)
 
-                    result = run_tool(name, inputs)
-                    log("→", result[:200].replace("\n", " "), "90")
-                    tool_results.append({
-                        "type": "tool_result", "tool_use_id": block.id, "content": result,
-                    })
+        for text in text_parts:
+            log("THINKING", text.strip()[:220], "93")
 
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+        if fn_calls:
+            tool_response_parts = []
+            for fc in fn_calls:
+                tool_name = fc.name
+                tool_args = dict(fc.args)
+                log("TOOL", f"{tool_name}({list(tool_args.keys())})", "94")
+                result = run_tool(tool_name, tool_args)
+                log("RESULT", result[:300], "92")
+                tool_response_parts.append(
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=tool_name,
+                            response={"result": result},
+                        )
+                    )
+                )
+            response = chat.send_message(tool_response_parts)
+            continue
 
-        elif response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    log("AGENT", block.text.strip()[:400], "93")
-            print(f"\n{'─'*64}")
-            print(f"✅ Done in {step} steps.")
-            reports = sorted(glob.glob(os.path.join(REPORTS_DIR, "esg_brief_*.md")), reverse=True)
-            if reports:
-                print(f"📄 Latest briefing: {reports[0]}")
-                pdf = reports[0].replace(".md", ".pdf")
-                if os.path.exists(pdf):
-                    print(f"📑 PDF: {pdf}")
-            break
-        else:
-            log("WARNING", f"Unexpected stop: {response.stop_reason}", "91")
-            break
+        # No function calls — model is done
+        final_text = "\n".join(text_parts).strip()
+        if final_text:
+            log("FINAL", final_text[:500], "92")
+        print("\n✅ Briefing complete.")
+        break
     else:
-        print(f"\n⚠️  Hit step limit ({MAX_STEPS}).")
-
+        print(f"\n⚠️  Reached max steps ({MAX_STEPS}).")
 
 # ──────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -168,19 +186,7 @@ def run_agent():
 if __name__ == "__main__":
     if "--show-last" in sys.argv:
         show_last_report()
-        sys.exit(0)
-    if "--demo-lca" in sys.argv:
+    elif "--demo-lca" in sys.argv:
         demo_lca()
-        sys.exit(0)
-
-    missing = [k for k in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY") if not os.getenv(k)]
-    if missing:
-        for key in missing:
-            print(f"❌ Missing: {key}")
-        print("\nSet them (or put them in a .env file):")
-        print("  export ANTHROPIC_API_KEY=sk-ant-...")
-        print("  export TAVILY_API_KEY=tvly-...")
-        print("\nTip: `python agent.py --demo-lca` runs the LCA engine with no keys needed.")
-        sys.exit(1)
-
-    run_agent()
+    else:
+        run_agent()
