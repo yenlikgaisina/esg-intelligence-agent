@@ -1,5 +1,5 @@
 """
-agent.py — ESG Intelligence Agent
+agent.py - ESG Intelligence Agent
 Runs every morning to scan ESG reports, construction news, and sustainability
 regulations, track embodied-carbon trends, run an automated A1-A3 LCA, and
 generate a branded PDF briefing for construction/built-environment clients.
@@ -19,20 +19,21 @@ import sys
 import json
 import glob
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS
 from prompts import get_system_prompt
 from config import MODEL, MAX_TOKENS, MAX_STEPS, REPORTS_DIR, FOCUS_REGION
 
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def log(label: str, text: str, color: str = "0"):
+def log(label, text, color="0"):
     print(f"\033[{color}m[{label}]\033[0m {text}")
 
-def run_tool(name: str, inputs: dict) -> str:
+def run_tool(name, inputs):
     if name not in TOOL_FUNCTIONS:
         return f"Unknown tool: {name}"
     try:
@@ -44,15 +45,14 @@ def run_tool(name: str, inputs: dict) -> str:
 def show_last_report():
     reports = sorted(glob.glob(os.path.join(REPORTS_DIR, "esg_brief_*.md")), reverse=True)
     if not reports:
-        print("No briefings found yet. Run `python agent.py` first.")
+        print("No briefings found yet.")
         return
     latest = reports[0]
-    print(f"\n📄 {latest}\n{'─'*64}\n")
+    print(f"\n{latest}\n")
     with open(latest, encoding="utf-8") as f:
         print(f.read())
 
 def demo_lca():
-    """Run the automated LCA engine on a sample project — no API key needed."""
     from tools import estimate_embodied_carbon
     sample = json.dumps([
         {"material": "concrete C32/40", "quantity": 850, "unit": "m3"},
@@ -62,7 +62,7 @@ def demo_lca():
         {"material": "glass",           "quantity": 22,  "unit": "t"},
         {"material": "mineral wool",    "quantity": 12,  "unit": "t"},
     ])
-    print("Sample project — mid-rise concrete-frame office:\n")
+    print("Sample project - mid-rise concrete-frame office:\n")
     print(estimate_embodied_carbon(sample))
 
 DAILY_QUESTION = (
@@ -75,113 +75,115 @@ DAILY_QUESTION = (
     "Be specific, quantitative, and senior. This briefing goes to construction clients."
 )
 
-# ──────────────────────────────────────────────────────────────────────────
-# Gemini tool schema conversion
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Build Gemini tool declarations from the existing Anthropic-style definitions
+# ---------------------------------------------------------------------------
 
 def _build_gemini_tools(tool_defs):
-    """Convert Anthropic-style tool definitions to Gemini FunctionDeclarations."""
     type_map = {
-        "string": genai.protos.Type.STRING,
-        "integer": genai.protos.Type.INTEGER,
-        "number": genai.protos.Type.NUMBER,
-        "boolean": genai.protos.Type.BOOLEAN,
-        "array": genai.protos.Type.ARRAY,
-        "object": genai.protos.Type.OBJECT,
+        "string": "STRING", "integer": "INTEGER", "number": "NUMBER",
+        "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT",
     }
     declarations = []
     for t in tool_defs:
         schema = t.get("input_schema", {})
         props = {}
         for prop_name, prop_def in schema.get("properties", {}).items():
-            g_type = type_map.get(prop_def.get("type", "string"), genai.protos.Type.STRING)
-            props[prop_name] = genai.protos.Schema(
-                type=g_type,
+            props[prop_name] = types.Schema(
+                type=type_map.get(prop_def.get("type", "string"), "STRING"),
                 description=prop_def.get("description", ""),
             )
         declarations.append(
-            genai.protos.FunctionDeclaration(
+            types.FunctionDeclaration(
                 name=t["name"],
                 description=t.get("description", ""),
-                parameters=genai.protos.Schema(
-                    type=genai.protos.Type.OBJECT,
+                parameters=types.Schema(
+                    type="OBJECT",
                     properties=props,
                     required=schema.get("required", []),
                 ),
             )
         )
-    return [genai.protos.Tool(function_declarations=declarations)]
+    return [types.Tool(function_declarations=declarations)]
 
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Main agentic loop
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def run_agent():
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     gemini_tools = _build_gemini_tools(TOOL_DEFINITIONS)
-    model = genai.GenerativeModel(
-        model_name=MODEL,
-        system_instruction=get_system_prompt(),
+    system_prompt = get_system_prompt()
+
+    print(f"\n{'='*64}")
+    print(f"ESG Intelligence Agent - focus: {FOCUS_REGION} - model: {MODEL}")
+    print(f"{'='*64}")
+
+    contents = [types.Content(role="user", parts=[types.Part(text=DAILY_QUESTION)])]
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
         tools=gemini_tools,
+        max_output_tokens=MAX_TOKENS,
     )
-    chat = model.start_chat()
-
-    print(f"\n{'─'*64}")
-    print(f"🌍 ESG Intelligence Agent · focus: {FOCUS_REGION} · model: {MODEL}")
-    print(f"{'─'*64}")
-
-    response = chat.send_message(DAILY_QUESTION)
 
     step = 0
     while step < MAX_STEPS:
         step += 1
         log("STEP", f"{step}/{MAX_STEPS}", "90")
 
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+            config=config,
+        )
+
         candidate = response.candidates[0]
-        finish_reason = candidate.finish_reason
 
         text_parts = []
         fn_calls = []
         for part in candidate.content.parts:
             if hasattr(part, "text") and part.text:
                 text_parts.append(part.text)
-            if hasattr(part, "function_call") and part.function_call.name:
+            if hasattr(part, "function_call") and part.function_call and part.function_call.name:
                 fn_calls.append(part.function_call)
 
         for text in text_parts:
             log("THINKING", text.strip()[:220], "93")
 
+        # Append assistant turn to history
+        contents.append(candidate.content)
+
         if fn_calls:
-            tool_response_parts = []
+            tool_parts = []
             for fc in fn_calls:
                 tool_name = fc.name
-                tool_args = dict(fc.args)
+                tool_args = dict(fc.args) if fc.args else {}
                 log("TOOL", f"{tool_name}({list(tool_args.keys())})", "94")
                 result = run_tool(tool_name, tool_args)
                 log("RESULT", result[:300], "92")
-                tool_response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
+                tool_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
                             name=tool_name,
                             response={"result": result},
                         )
                     )
                 )
-            response = chat.send_message(tool_response_parts)
+            contents.append(types.Content(role="tool", parts=tool_parts))
             continue
 
-        # No function calls — model is done
+        # No function calls - done
         final_text = "\n".join(text_parts).strip()
         if final_text:
             log("FINAL", final_text[:500], "92")
-        print("\n✅ Briefing complete.")
+        print("\nBriefing complete.")
         break
     else:
-        print(f"\n⚠️  Reached max steps ({MAX_STEPS}).")
+        print(f"\nReached max steps ({MAX_STEPS}).")
 
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Entry point
-# ──────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if "--show-last" in sys.argv:
