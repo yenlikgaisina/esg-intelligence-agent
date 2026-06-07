@@ -1,5 +1,5 @@
 """
-config.py — Central configuration for the ESG Intelligence Agent.
+config.py - Central configuration for the ESG Intelligence Agent.
 Override any of these with environment variables (e.g. in a .env file).
 """
 
@@ -7,14 +7,15 @@ import os
 
 # Load a local .env file if python-dotenv is installed (optional convenience).
 try:
-            from dotenv import load_dotenv
-            load_dotenv()
+    from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-            pass
+    pass
 
 # ---- Gemini (primary agent model) ----
-# Flash is the free-tier default; override with ESG_MODEL=gemini-1.5-pro for deeper analysis.
-MODEL = os.getenv("ESG_MODEL", "gemini-1.5-flash")
+# gemini-2.0-flash is the free-tier default (fast + capable).
+# Override with ESG_MODEL=gemini-2.5-pro for deeper analysis.
+MODEL = os.getenv("ESG_MODEL", "gemini-2.0-flash")
 MAX_TOKENS = int(os.getenv("ESG_MAX_TOKENS", "6000"))
 MAX_STEPS = int(os.getenv("ESG_MAX_STEPS", "30"))
 
