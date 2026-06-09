@@ -12,14 +12,15 @@ try:
 except ImportError:
     pass
 
-# ---- OpenAI (primary agent model) ----
-# gpt-4o is the default (fast + capable, strong tool-calling).
-# Override with ESG_MODEL=gpt-4o-mini for cheaper runs.
-MODEL = os.getenv("ESG_MODEL", "gpt-4o")
+# ---- Gemini (primary agent model) ----
+# gemini-2.5-flash is the current free-tier default (fast + capable).
+# Override with ESG_MODEL=gemini-2.5-pro for deeper analysis.
+MODEL = os.getenv("ESG_MODEL", "gemini-2.5-flash")
 MAX_TOKENS = int(os.getenv("ESG_MAX_TOKENS", "6000"))
 MAX_STEPS = int(os.getenv("ESG_MAX_STEPS", "30"))
 
-# ---- OpenAI API ----
+# ---- OpenAI (secondary / cross-check model) ----
+# Used by the openai_analysis tool to provide a second-opinion LCA or regulatory summary.
 # Set OPENAI_API_KEY in .env or as a GitHub Actions secret to enable.
 OPENAI_MODEL = os.getenv("ESG_OPENAI_MODEL", "gpt-4o")
 OPENAI_ENABLED = bool(os.getenv("OPENAI_API_KEY"))
