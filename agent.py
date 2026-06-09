@@ -6,9 +6,9 @@ generate a branded PDF briefing for construction/built-environment clients.
 Built for the Kazakhstan + global construction market (with a CBAM lens), this
 adapts the daily-monitor agent pattern into a sustainability intelligence tool.
 Usage:
-    python agent.py                # run today's briefing now
-    python agent.py --show-last    # print the most recent briefing
-    python agent.py --demo-lca     # run a sample embodied-carbon estimate only
+    python agent.py              # run today's briefing now
+    python agent.py --show-last  # print the most recent briefing
+    python agent.py --demo-lca   # run a sample embodied-carbon estimate only
 Automate it:
     Mac/Linux cron:  0 7 * * *  cd /path/to/esg-intelligence-agent && python agent.py
     Or use the included GitHub Actions workflow (.github/workflows/daily-esg-brief.yml).
@@ -19,8 +19,7 @@ import sys
 import json
 import glob
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS
 from prompts import get_system_prompt
@@ -58,9 +57,9 @@ def demo_lca():
         {"material": "concrete C32/40", "quantity": 850, "unit": "m3"},
         {"material": "rebar",           "quantity": 95,  "unit": "t"},
         {"material": "structural steel","quantity": 60,  "unit": "t"},
-        {"material": "aluminium",       "quantity": 8,   "unit": "t"},
-        {"material": "glass",           "quantity": 22,  "unit": "t"},
-        {"material": "mineral wool",    "quantity": 12,  "unit": "t"},
+        {"material": "aluminium",        "quantity": 8,   "unit": "t"},
+        {"material": "glass",            "quantity": 22,  "unit": "t"},
+        {"material": "mineral wool",     "quantity": 12,  "unit": "t"},
     ])
     print("Sample project - mid-rise concrete-frame office:\n")
     print(estimate_embodied_carbon(sample))
@@ -76,104 +75,96 @@ DAILY_QUESTION = (
 )
 
 # ---------------------------------------------------------------------------
-# Build Gemini tool declarations from the existing Anthropic-style definitions
+# Build OpenAI tool declarations from the existing Anthropic-style definitions
 # ---------------------------------------------------------------------------
 
-def _build_gemini_tools(tool_defs):
-    type_map = {
-        "string": "STRING", "integer": "INTEGER", "number": "NUMBER",
-        "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT",
-    }
-    declarations = []
+def _build_openai_tools(tool_defs):
+    tools = []
     for t in tool_defs:
         schema = t.get("input_schema", {})
-        props = {}
-        for prop_name, prop_def in schema.get("properties", {}).items():
-            props[prop_name] = types.Schema(
-                type=type_map.get(prop_def.get("type", "string"), "STRING"),
-                description=prop_def.get("description", ""),
-            )
-        declarations.append(
-            types.FunctionDeclaration(
-                name=t["name"],
-                description=t.get("description", ""),
-                parameters=types.Schema(
-                    type="OBJECT",
-                    properties=props,
-                    required=schema.get("required", []),
-                ),
-            )
-        )
-    return [types.Tool(function_declarations=declarations)]
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": {
+                    "type": "object",
+                    "properties": schema.get("properties", {}),
+                    "required": schema.get("required", []),
+                },
+            },
+        })
+    return tools
 
 # ---------------------------------------------------------------------------
 # Main agentic loop
 # ---------------------------------------------------------------------------
 
 def run_agent():
-    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    gemini_tools = _build_gemini_tools(TOOL_DEFINITIONS)
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    openai_tools = _build_openai_tools(TOOL_DEFINITIONS)
     system_prompt = get_system_prompt()
 
     print(f"\n{'='*64}")
     print(f"ESG Intelligence Agent - focus: {FOCUS_REGION} - model: {MODEL}")
     print(f"{'='*64}")
 
-    contents = [types.Content(role="user", parts=[types.Part(text=DAILY_QUESTION)])]
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        tools=gemini_tools,
-        max_output_tokens=MAX_TOKENS,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": DAILY_QUESTION},
+    ]
 
     step = 0
     while step < MAX_STEPS:
         step += 1
         log("STEP", f"{step}/{MAX_STEPS}", "90")
 
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=MODEL,
-            contents=contents,
-            config=config,
+            messages=messages,
+            tools=openai_tools,
+            max_tokens=MAX_TOKENS,
         )
 
-        candidate = response.candidates[0]
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
 
-        text_parts = []
-        fn_calls = []
-        for part in candidate.content.parts:
-            if hasattr(part, "text") and part.text:
-                text_parts.append(part.text)
-            if hasattr(part, "function_call") and part.function_call and part.function_call.name:
-                fn_calls.append(part.function_call)
+        if message.content:
+            log("THINKING", message.content.strip()[:220], "93")
 
-        for text in text_parts:
-            log("THINKING", text.strip()[:220], "93")
+        # Append the assistant turn to history (must include tool_calls if present)
+        messages.append({
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in tool_calls
+            ] if tool_calls else None,
+        })
 
-        # Append assistant turn to history
-        contents.append(candidate.content)
-
-        if fn_calls:
-            tool_parts = []
-            for fc in fn_calls:
-                tool_name = fc.name
-                tool_args = dict(fc.args) if fc.args else {}
+        if tool_calls:
+            for tc in tool_calls:
+                tool_name = tc.function.name
+                try:
+                    tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError:
+                    tool_args = {}
                 log("TOOL", f"{tool_name}({list(tool_args.keys())})", "94")
                 result = run_tool(tool_name, tool_args)
                 log("RESULT", result[:300], "92")
-                tool_parts.append(
-                    types.Part(
-                        function_response=types.FunctionResponse(
-                            name=tool_name,
-                            response={"result": result},
-                        )
-                    )
-                )
-            contents.append(types.Content(role="tool", parts=tool_parts))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
             continue
 
-        # No function calls - done
-        final_text = "\n".join(text_parts).strip()
+        # No tool calls - done
+        final_text = (message.content or "").strip()
         if final_text:
             log("FINAL", final_text[:500], "92")
         print("\nBriefing complete.")
