@@ -25,7 +25,7 @@ about it.* This agent answers that automatically.
 
 It combines three things into one tool:
 
-- **Data-science engineering** — an agentic tool-use loop over the Anthropic API.
+- **Data-science engineering** — an agentic tool-use loop over the Google Gemini API.
 - **Circular-economy expertise** — every result surfaces lower-carbon, recycled,
   and material-substitution opportunities with quantified savings.
 - **Consultancy value** — output is a client-ready intelligence briefing, not a
@@ -91,7 +91,7 @@ python agent.py --show-last # print the most recent briefing
 ```
 
 You need two keys (both have free tiers):
-- `ANTHROPIC_API_KEY` — https://console.anthropic.com/
+- `GEMINI_API_KEY` — https://aistudio.google.com/apikey
 - `TAVILY_API_KEY` — https://tavily.com/
 
 ---
@@ -101,7 +101,7 @@ You need two keys (both have free tiers):
 **GitHub Actions (recommended — runs in the cloud).** The included
 [`.github/workflows/daily-esg-brief.yml`](.github/workflows/daily-esg-brief.yml)
 runs daily, commits the new briefing back to the repo, and uploads it as an
-artifact. Add `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` under
+artifact. Add `GEMINI_API_KEY` and `TAVILY_API_KEY` under
 **Settings → Secrets and variables → Actions**.
 
 **Local cron (Mac/Linux):**
@@ -114,7 +114,7 @@ artifact. Add `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` under
 ## How it works
 
 ```
-agent.py        orchestrates the Anthropic tool-use loop (the "daily monitor")
+agent.py        orchestrates the Gemini tool-use loop (the "daily monitor")
 prompts.py      the fixed analyst brief — what to scan and how to report
 tools.py        6 tools: web_search · read_page · lookup_carbon_factor ·
                 estimate_embodied_carbon · load_history · save_report
